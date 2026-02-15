@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+storage/working_buffer.json
+storage/wal.jsonl
+.env
