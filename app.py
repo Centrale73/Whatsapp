@@ -1,82 +1,119 @@
 import os
+import uuid
+import json
+import re
 import logging
-from fastapi import FastAPI, Request, BackgroundTasks, Form
+from fastapi import FastAPI, Request, BackgroundTasks
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
 from twilio.rest import Client
 from twilio.twiml.messaging_response import MessagingResponse
-from agent import get_whatsapp_agent
+from agent import create_appointment_agent
 from dotenv import load_dotenv
 
-# Load environment variables
 load_dotenv()
 
-# Configure structured logging for observability (Metric: Defect Rate tracking)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-app = FastAPI()
+app = FastAPI(title="Appointment Setter")
 
-# Initialize Twilio Client for asynchronous responses (Avoiding 15s timeout defect)
-account_sid = os.getenv('TWILIO_ACCOUNT_SID')
-auth_token = os.getenv('TWILIO_AUTH_TOKEN')
+# ── Twilio setup ──────────────────────────────────────────────────────────
+account_sid   = os.getenv('TWILIO_ACCOUNT_SID')
+auth_token    = os.getenv('TWILIO_AUTH_TOKEN')
 twilio_client = Client(account_sid, auth_token) if account_sid and auth_token else None
-twilio_number = os.getenv('TWILIO_PHONE_NUMBER')
+SANDBOX_FROM  = "whatsapp:+14155238886"  # Twilio sandbox number (no business account needed)
+OWNER_WA      = f"whatsapp:{os.getenv('OWNER_WHATSAPP', '')}"
 
-# Initialize Agent
-agent = get_whatsapp_agent()
 
-def process_message_background(sender_number: str, incoming_msg: str):
-    """
-    Background task to process the message and send response asynchronously.
-    This decouples processing time from the Twilio webhook timeout.
-    """
+def notify_owner(appt: dict):
+    """Send appointment summary to your personal WhatsApp via Twilio sandbox."""
+    if not twilio_client or not os.getenv('OWNER_WHATSAPP'):
+        logger.warning("Twilio not configured or OWNER_WHATSAPP missing.")
+        return
+    body = (
+        f"\U0001f4c5 New Appointment\n"
+        f"\U0001f464 Person: {appt['person']}\n"
+        f"\U0001f4cb Subject: {appt['subject']}\n"
+        f"\u23f0 Time: {appt['time']}"
+    )
+    msg = twilio_client.messages.create(from_=SANDBOX_FROM, body=body, to=OWNER_WA)
+    logger.info(f"Appointment notification sent: {msg.sid}")
+
+
+def extract_booking(response_text: str):
+    """Parse BOOK:{...} signal from agent response. Returns (clean_text, appt_dict|None)."""
+    match = re.search(r'BOOK:(\{.*?\})', response_text)
+    if match:
+        try:
+            appt = json.loads(match.group(1))
+            clean = re.sub(r'BOOK:\{.*?\}', '', response_text).strip()
+            return clean, appt
+        except json.JSONDecodeError:
+            pass
+    return response_text, None
+
+
+# ── Web chat endpoint (for website UI) ─────────────────────────────────
+class ChatRequest(BaseModel):
+    message: str
+    session_id: str | None = None
+
+
+@app.get("/", response_class=HTMLResponse)
+async def root():
+    with open("templates/index.html") as f:
+        return f.read()
+
+
+@app.post("/chat")
+async def chat(req: ChatRequest):
+    session_id = req.session_id or str(uuid.uuid4())
+    agent = create_appointment_agent(session_id)
+    result = agent.run(req.message)
+    response_text = result.content if hasattr(result, 'content') else str(result)
+
+    response_text, appt = extract_booking(response_text)
+    if appt:
+        notify_owner(appt)
+
+    return {"session_id": session_id, "response": response_text}
+
+
+# ── WhatsApp webhook (for direct WhatsApp bookings) ───────────────────────
+def process_webhook_background(sender_number: str, incoming_msg: str):
     try:
-        logger.info(f"Processing message from {sender_number}: {incoming_msg}")
-        
-        # Run agent logic (Sync or Async)
-        # Using .run() as per Agno documentation for sync execution
-        response = agent.run(incoming_msg)
-        
-        # Extract content safely
-        response_text = response.content if hasattr(response, 'content') else str(response)
+        session_id = f"wa_{sender_number.replace('whatsapp:+', '')}"
+        agent = create_appointment_agent(session_id)
+        result = agent.run(incoming_msg)
+        response_text = result.content if hasattr(result, 'content') else str(result)
 
-        # Send response back via Twilio API
-        if twilio_client and twilio_number:
-            message = twilio_client.messages.create(
-                from_=twilio_number,
+        response_text, appt = extract_booking(response_text)
+        if appt:
+            notify_owner(appt)
+
+        if twilio_client:
+            twilio_client.messages.create(
+                from_=SANDBOX_FROM,
                 body=response_text,
                 to=sender_number
             )
-            logger.info(f"Response sent to {sender_number}: {message.sid}")
-        else:
-            logger.warning("Twilio credentials not configured. Response not sent.")
-            
     except Exception as e:
-        logger.error(f"Error processing message: {e}", exc_info=True)
-        # Optionally send error message to user
+        logger.error(f"Webhook error: {e}", exc_info=True)
+
 
 @app.post("/webhook")
 async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks):
-    """
-    Webhook endpoint for Twilio.
-    Returns 200 OK immediately and processes in background to avoid timeout.
-    """
-    # Parse form data from Twilio
     form_data = await request.form()
     incoming_msg = form_data.get('Body', '').strip()
     sender_number = form_data.get('From', '')
-
     if not incoming_msg:
-        logger.info("Empty message received")
         return {"status": "no message"}
-
-    # Add processing task to background
-    background_tasks.add_task(process_message_background, sender_number, incoming_msg)
-
-    # Return empty TwiML to acknowledge receipt without replying immediately
+    background_tasks.add_task(process_webhook_background, sender_number, incoming_msg)
     resp = MessagingResponse()
     return str(resp)
 
+
 if __name__ == "__main__":
     import uvicorn
-    # Use environment port for deployment flexibility
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
