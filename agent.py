@@ -2,37 +2,42 @@ import os
 from agno.agent import Agent
 from agno.models.perplexity import Perplexity
 from agno.storage.sqlite import SqliteStorage
+from pydantic import BaseModel, Field
 
-SYSTEM_PROMPT = """You are a friendly appointment booking assistant on a website.
+# ── Structured Output Model ────────────────────────────────────────────────
+class AppointmentDetails(BaseModel):
+    subject: str = Field(..., description="The purpose of the appointment.")
+    person_name: str = Field(..., description="Full name of the person.")
+    preferred_time: str = Field(..., description="The date and time requested.")
 
-Your ONLY job is to collect these 3 things, one at a time, conversationally:
-1. Subject — What is the appointment about?
-2. Name — Who is booking (their name)?
-3. Date & Time — When do they want to meet?
-
-Rules:
-- Ask one question at a time.
-- Confirm all 3 before finalizing.
-- Once all 3 are confirmed, output EXACTLY this on its own line:
-  BOOK:{"subject":"...","person":"...","time":"..."}
-- Then tell the user: "Your appointment is booked! You will be contacted shortly."
-- Never ask for anything else after all 3 are collected."""
-
-
-def create_appointment_agent(session_id: str) -> Agent:
-    """Factory: creates a per-session agent with isolated SQLite memory."""
-    if not os.getenv("PERPLEXITY_API_KEY"):
-        raise EnvironmentError("PERPLEXITY_API_KEY not set.")
+def get_appointment_agent(session_id: str) -> Agent:
+    """
+    Factory to generate a production-ready Agno agent.
+    Optimized for conversational flow on WhatsApp with session isolation.
+    """
     return Agent(
-        name="AppointmentSetter",
-        model=Perplexity(id="sonar"),  # sonar is 10x cheaper than sonar-pro, sufficient for conversation
-        description=SYSTEM_PROMPT,
+        name="WhatsAppSetter",
+        model=Perplexity(id="sonar"), # Fast, grounded, and cost-effective
         session_id=session_id,
         storage=SqliteStorage(
-            table_name="appointment_sessions",
-            db_file="storage/appointments.db"
+            table_name="agent_memory",
+            db_file="storage/whatsapp_agent.db"
         ),
+        description=(
+            "You are a professional assistant for WhatsApp. "
+            "Your primary goal is to schedule appointments. "
+            "If the user asks general questions, use your Perplexity search "
+            "to answer them accurately, but always gently steer back to booking."
+        ),
+        instructions=[
+            "1. Be concise; WhatsApp users prefer short messages.",
+            "2. Collect: Name, Subject, and Time.",
+            "3. Ask for only one missing piece of information at a time.",
+            "4. When all info is gathered, confirm the details with the user.",
+            "5. After confirmation, use the 'set_appointment' signal."
+        ],
+        # Persistent memory configuration
         add_history_to_messages=True,
-        num_history_responses=10,
-        markdown=False,
+        num_history_responses=12,
+        markdown=False, # WhatsApp has limited markdown support
     )
